@@ -1,0 +1,17 @@
+# pi-cell configuration — paths only, NO secrets (put those in secrets.env)
+REPO=/home/eduardoneville/work/my-repo
+STATE_DIR=/var/lib/pi-cell/state
+BUN_HOST_DIR=/home/eduardoneville/.bun
+# Optional: host ~/.pi/agent dir (auth.json source of truth). Default: invoking user's.
+PI_AGENT_DIR=
+# auth.json mount: ro (default, sandbox reads host file live) | rw (sandbox can also write)
+AUTH_MODE=ro
+# Egress beyond DNS + TLS:443 (all optional):
+DB_ADDR=            # leave empty for "any host", or e.g. 10.0.0.5
+DB_PORT=5432
+EXTRA_PORTS=        # comma list, e.g. 3000,8080 (all destinations)
+# Optional git identity injected as env vars (so agent commits are attributed):
+GIT_NAME=
+GIT_EMAIL=
+# Optional extra args passed to pi, e.g. PI_ARGS="--provider anthropic"
+PI_ARGS=

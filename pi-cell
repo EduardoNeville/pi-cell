@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+#
+# pi-cell — run the whole pi agent inside a bubblewrap sandbox.
+#
+#   sudo pi-cell setup [--install]  one-time: deps check, sandbox user, state dir,
+#                                   config + secrets placeholders, nftables egress
+#                                   ruleset, repo ACLs
+#   sudo pi-cell run [-- args...]   launch pi inside the sandbox (interactive TUI)
+#   sudo pi-cell grant-auth       (re-)grant ACLs so host auth.json is live in the sandbox
+#   sudo pi-cell chown              hand repo files back to the real user
+#   sudo pi-cell teardown [--purge] remove the nftables ruleset (and user/config)
+#   pi-cell check                   non-root prerequisite check
+#
+# Trust boundary:
+#   pi can modify ONLY {repo -> /workspace, state -> /state}
+#   pi can reach  ONLY {DNS, TLS:443, configured DB/ports}
+#   everything else is not visible, not writable, not reachable.
+#
+# Mechanism: one long-lived sandbox (namespaces, no daemon) whose writable host
+# paths are exactly the two above. Network is shared but the nftables ruleset
+# restricts only the sandbox uid. API keys enter via --setenv from the root-only
+# secrets file; the egress ruleset is the exfiltration control.
+set -euo pipefail
+
+readonly CONF="${PICELL_CONF:-/etc/pi-cell/config}"
+readonly SECRETS="${PICELL_SECRETS:-/etc/pi-cell/secrets.env}"
+readonly NFT="${PICELL_NFT:-/etc/pi-cell/pi-cell.nft}"
+readonly SANDBOX_USER=pi-sandbox
+
+die()  { echo "pi-cell: error: $*" >&2; exit 1; }
+info() { echo "pi-cell: $*"; }
+need_root() { [[ $(id -u) == 0 ]] || die "this command needs root (run with sudo)"; }
+
+# ---------------------------------------------------------------- config
+load_config() {
+  [[ -r $CONF ]] || die "config not found at $CONF (run: sudo pi-cell setup)"
+  # shellcheck disable=SC1090
+  source "$CONF"
+  : "${REPO:?REPO unset in $CONF}"
+  : "${STATE_DIR:?STATE_DIR unset in $CONF}"
+  : "${BUN_HOST_DIR:?BUN_HOST_DIR unset in $CONF}"
+  [[ -d $REPO ]]        || die "REPO is not a directory: $REPO"
+  [[ -d $STATE_DIR ]]   || die "STATE_DIR is not a directory (run: sudo pi-cell setup): $STATE_DIR"
+  [[ -d $BUN_HOST_DIR ]] || die "BUN_HOST_DIR is not a directory: $BUN_HOST_DIR"
+  DB_ADDR="${DB_ADDR:-}"
+  DB_PORT="${DB_PORT:-5432}"
+  EXTRA_PORTS="${EXTRA_PORTS:-}"
+  PI_ARGS="${PI_ARGS:-}"
+  GIT_NAME="${GIT_NAME:-}"
+  GIT_EMAIL="${GIT_EMAIL:-}"
+  AUTH_MODE="${AUTH_MODE:-ro}"   # ro = sandbox reads host auth.json live; rw = sandbox can also write
+  # host pi agent dir = source of truth for auth.json (config can override)
+  if [[ -n ${PI_AGENT_DIR:-} ]]; then
+    HOST_PI_AGENT=$PI_AGENT_DIR
+  elif [[ -n ${SUDO_USER:-} ]]; then
+    HOST_PI_AGENT="$(getent passwd "$SUDO_USER" | cut -d: -f6)/.pi/agent"
+  else
+    HOST_PI_AGENT="$HOME/.pi/agent"
+  fi
+}
+
+ensure_state_agent() {
+  # the sandbox's ~/.pi/agent; the auth.json placeholder is where the host's
+  # real auth.json gets bind-mounted (target must exist before the bind)
+  mkdir -p "$STATE_DIR/.pi/agent"
+  chown -R "$SANDBOX_USER:$SANDBOX_USER" "$STATE_DIR/.pi/agent"
+  local target="$STATE_DIR/.pi/agent/auth.json"
+  if [[ ! -e $target ]]; then
+    : > "$target"
+    chown "$SANDBOX_USER:$SANDBOX_USER" "$target"
+  fi
+}
+
+grant_auth_access() {
+  # Make the HOST's real auth.json bind-mountable + readable by the sandbox
+  # user — no copying. ~/.pi/agent is 0700 and auth.json is 0600 owned by the
+  # real user, so the sandbox user needs ACLs: x on the dir (traverse) and
+  # r/rw on the file. Re-granted on every run because pi rewrites auth.json
+  # with chmod(0600), which clobbers the ACL mask between sessions.
+  [[ -d $HOST_PI_AGENT ]] || {
+    info "no host agent dir at $HOST_PI_AGENT — sandbox auth will be local-only"
+    return 0
+  }
+  setfacl -m "u:$SANDBOX_USER:x" "$HOST_PI_AGENT" 2>/dev/null \
+    || info "could not set ACL on $HOST_PI_AGENT (run setup with sudo)"
+  if [[ -f $HOST_PI_AGENT/auth.json ]]; then
+    local perm=r
+    [[ $AUTH_MODE == rw ]] && perm=rw
+    setfacl -m "u:$SANDBOX_USER:$perm" "$HOST_PI_AGENT/auth.json"
+    info "live-bind auth.json: granted ACL u:$SANDBOX_USER:$perm on $HOST_PI_AGENT/auth.json"
+  else
+    info "no host auth.json at $HOST_PI_AGENT/auth.json — pi can /login inside the sandbox (local-only)"
+  fi
+}
+
+# --------------------------------------------------------------- secrets
+load_secrets() {
+  SECRET_ARGS=()
+  [[ -r $SECRETS ]] || { info "no secrets file — credentials come from the live auth.json bind"; return 0; }
+  while IFS= read -r line; do
+    line="${line%%#*}"                       # strip comments
+    line="${line#"${line%%[![:space:]]*}"}"  # trim leading whitespace
+    [[ -n $line ]] || continue
+    [[ $line == *=* ]] || continue
+    SECRET_ARGS+=(--setenv "${line%%=*}" "${line#*=}")
+  done < "$SECRETS"
+}
+
+# ------------------------------------------------------------------ run
+cmd_run() {
+  [[ ${DRY_RUN:-0} == 1 ]] || need_root
+  load_config
+  load_secrets
+
+  if [[ ${DRY_RUN:-0} != 1 ]]; then
+    ensure_state_agent
+    grant_auth_access   # ACLs so the real host auth.json can be bind-mounted (no copy)
+  fi
+
+  local bwrap=(bwrap --die-with-parent
+    --unshare-user --unshare-pid --unshare-ipc --unshare-uts --share-net
+    --ro-bind /usr /usr
+    --ro-bind /usr/local /usr/local
+    --ro-bind /opt /opt
+    --ro-bind /etc /etc
+    --ro-bind /sys /sys
+    --ro-bind "$BUN_HOST_DIR" /bun
+    --bind "$REPO" /workspace
+    --bind "$STATE_DIR" /state
+    --tmpfs /tmp
+    --tmpfs /run
+    --proc /proc
+    --dev /dev
+    --tmpfs /dev/shm --size 536870912
+    --clearenv
+    --setenv PATH /bun/bin:/usr/local/bin:/usr/bin:/bin
+    --setenv HOME /state
+    --setenv TERM "${TERM:-xterm-256color}"
+    --setenv LANG "${LANG:-C.UTF-8}"
+    --setenv BUN_INSTALL /bun
+    "${SECRET_ARGS[@]}")
+
+  # live bind-mount of the host's real auth.json (no copy):
+  if [[ -f $HOST_PI_AGENT/auth.json ]]; then
+    if [[ $AUTH_MODE == rw ]]; then
+      bwrap+=(--bind "$HOST_PI_AGENT/auth.json" /state/.pi/agent/auth.json)
+    else
+      bwrap+=(--ro-bind "$HOST_PI_AGENT/auth.json" /state/.pi/agent/auth.json)
+    fi
+  fi
+
+  [[ -d /dev/pts ]] && bwrap+=(--dev-bind /dev/pts /dev/pts)
+
+  [[ -z $GIT_NAME  ]] || bwrap+=(--setenv GIT_AUTHOR_NAME "$GIT_NAME" --setenv GIT_COMMITTER_NAME "$GIT_NAME")
+  [[ -z $GIT_EMAIL ]] || bwrap+=(--setenv GIT_AUTHOR_EMAIL "$GIT_EMAIL" --setenv GIT_COMMITTER_EMAIL "$GIT_EMAIL")
+
+  bwrap+=(--chdir /workspace)
+
+  local pi_args=()
+  read -r -a pi_args <<< "$PI_ARGS"   # split config PI_ARGS on whitespace
+
+  info "launching pi in sandbox (workspace=$REPO state=$STATE_DIR egress=DNS+443+db:${DB_PORT})"
+  # umask 002 + ACLs so files created by the sandbox stay editable by you.
+  local cmd=(sudo -u "$SANDBOX_USER" "${bwrap[@]}" -- \
+    /bin/sh -c 'umask 002; exec "$@"' pi /bun/bin/pi "${pi_args[@]}" "$@")
+  if [[ ${DRY_RUN:-0} == 1 ]]; then
+    printf '%q ' "${cmd[@]}"; echo; exit 0
+  fi
+  exec "${cmd[@]}"
+}
+
+# ----------------------------------------------------------------- setup
+cmd_setup() {
+  need_root
+
+  # 1. dependencies
+  local deps=(bubblewrap nftables acl) missing=()
+  for d in "${deps[@]}"; do
+    command -v "$d" >/dev/null 2>&1 || missing+=("$d")
+  done
+  if ((${#missing[@]})); then
+    if [[ ${INSTALL_DEPS:-0} == 1 ]]; then
+      info "installing: ${missing[*]}"
+      apt-get update -y >/dev/null
+      apt-get install -y "${missing[@]}" >/dev/null
+    else
+      die "missing packages: ${missing[*]} — rerun 'sudo pi-cell setup --install' or run: sudo apt-get install -y ${missing[*]}"
+    fi
+  fi
+
+  # 2. sandbox user
+  getent passwd "$SANDBOX_USER" >/dev/null || {
+    info "creating system user $SANDBOX_USER"
+    useradd --system --shell /usr/sbin/nologin --no-create-home "$SANDBOX_USER"
+  }
+  local uid; uid=$(id -u "$SANDBOX_USER")
+
+  # 3. directories
+  install -d -m 0755 /etc/pi-cell /var/lib/pi-cell
+
+  # read config if present (paths only, never secrets)
+  if [[ -r $CONF ]]; then
+    # shellcheck disable=SC1090
+    source "$CONF"
+    STATE_DIR="${STATE_DIR:-/var/lib/pi-cell/state}"
+    REPO="${REPO:-}"
+  else
+    STATE_DIR=/var/lib/pi-cell/state
+    REPO=""
+  fi
+  [[ -d $STATE_DIR ]] || install -d -m 0700 -o "$SANDBOX_USER" -g "$SANDBOX_USER" "$STATE_DIR"
+
+  # host pi agent dir (used for auth.json source of truth)
+  if [[ -n ${PI_AGENT_DIR:-} ]]; then
+    HOST_PI_AGENT=$PI_AGENT_DIR
+  elif [[ -n ${SUDO_USER:-} ]]; then
+    HOST_PI_AGENT="$(getent passwd "$SUDO_USER" | cut -d: -f6)/.pi/agent"
+  else
+    HOST_PI_AGENT="$HOME/.pi/agent"
+  fi
+
+  # sandbox's ~/.pi/agent: seeded from the host's auth.json, then sandbox-owned
+  ensure_state_agent
+  grant_auth_access
+
+  # 4. config + secrets placeholders
+  if [[ ! -e $CONF ]]; then
+    cat > "$CONF" <<'CFG'
+# pi-cell configuration — paths only, NO secrets (put those in secrets.env)
+REPO=/home/eduardoneville/work/my-repo
+STATE_DIR=/var/lib/pi-cell/state
+BUN_HOST_DIR=/home/eduardoneville/.bun
+# Optional: host ~/.pi/agent dir (auth.json source of truth). Default: invoking user's.
+PI_AGENT_DIR=
+# auth.json mount: ro (default, sandbox reads host file live) | rw (sandbox can also write)
+AUTH_MODE=ro
+# Egress beyond DNS + TLS:443 (all optional):
+DB_ADDR=            # leave empty for "any host", or e.g. 10.0.0.5
+DB_PORT=5432
+EXTRA_PORTS=        # comma list, e.g. 3000,8080 (all destinations)
+# Optional git identity injected as env vars (so agent commits are attributed):
+GIT_NAME=
+GIT_EMAIL=
+# Optional extra args passed to pi, e.g. PI_ARGS="--provider anthropic"
+PI_ARGS=
+CFG
+    chmod 0644 "$CONF"
+    info "wrote $CONF (edit REPO at minimum)"
+  fi
+
+  if [[ ! -e $SECRETS ]]; then
+    cat > "$SECRETS" <<'SEC'
+# pi-cell secrets — OPTIONAL. Credentials normally come from the live bind of
+# the host's auth.json. Add KEY=VALUE lines here only for providers you
+# configure via environment variables on the host and want inside the sandbox.
+# Example: OPENAI_API_KEY=sk-...
+SEC
+    chmod 0600 "$SECRETS"
+    info "wrote optional $SECRETS (only needed for env-configured providers)"
+  fi
+
+  # 5. bun cache inside the writable state (host ~/.bun is mounted read-only)
+  cat > "$STATE_DIR/bunfig.toml" <<'BUN'
+[install]
+cacheDir = "/state/bun-cache"
+BUN
+  chown -R "$SANDBOX_USER:$SANDBOX_USER" "$STATE_DIR"
+
+  # 6. nftables ruleset (egress + inbound, restricted to the sandbox uid)
+  local db_rule=""
+  if [[ -n $DB_ADDR ]]; then
+    db_rule="    meta skuid $uid ip daddr $DB_ADDR tcp dport ${DB_PORT:-5432} accept"
+  else
+    db_rule="    meta skuid $uid tcp dport ${DB_PORT:-5432} accept"
+  fi
+  local extra_rules=""
+  local p
+  for p in ${EXTRA_PORTS//,/ }; do
+    [[ -n $p ]] && extra_rules+="    meta skuid $uid tcp dport $p accept"$'\n'
+  done
+  info "writing nftables ruleset ($NFT)"
+  cat > "$NFT" <<EOF
+table inet pi-cell {
+  chain output {
+    type filter hook output priority 0; policy accept;
+    meta skuid $uid ct state established,related accept
+    meta skuid $uid udp dport 53 accept
+    meta skuid $uid tcp dport 53 accept
+    meta skuid $uid tcp dport 443 accept
+$db_rule
+${extra_rules}    meta skuid $uid drop
+  }
+  chain input {
+    type filter hook input priority 0; policy accept;
+    ct state established,related accept
+    iif "lo" accept
+    meta skuid $uid drop
+  }
+}
+EOF
+  nft delete table inet pi-cell 2>/dev/null || true
+  nft -f "$NFT"
+  info "nftables ruleset loaded: only uid $uid ($SANDBOX_USER) is restricted"
+
+  # 7. repo ACLs — sandbox can read/write the repo, and stays able to edit
+  #    files you created; new files inherit ACLs for both of you (via umask 002)
+  if [[ -n $REPO && -d $REPO ]]; then
+    local realuser="${SUDO_USER:-root}"
+    info "granting rwx ACLs on $REPO for $SANDBOX_USER and $realuser"
+    setfacl -R -m u:"$SANDBOX_USER":rwx -m d:u:"$SANDBOX_USER":rwx -- "$REPO"
+    if [[ $realuser != root ]]; then
+      setfacl -R -m u:"$realuser":rwx -m d:u:"$realuser":rwx -- "$REPO"
+    fi
+  else
+    info "REPO not set/valid yet — set REPO in $CONF and re-run setup for ACLs"
+  fi
+
+  info "done. Next:"
+  info "  1. edit $CONF          (set REPO; optional DB_ADDR/DB_PORT/EXTRA_PORTS)"
+  info "  2. re-run setup once so ACLs pick up the repo:   sudo pi-cell setup"
+  info "  3. launch:                                       sudo pi-cell run"
+  info "  (credentials: host auth.json is bind-mounted live into the sandbox — no copy)"
+  info "  (if you ever edit auth.json by hand, re-run setup or: sudo pi-cell grant-auth)"
+}
+
+# --------------------------------------------------------------- teardown
+cmd_teardown() {
+  need_root
+  if nft delete table inet pi-cell 2>/dev/null; then
+    info "nftables ruleset removed"
+  else
+    info "no ruleset to remove"
+  fi
+  if [[ ${PURGE:-0} == 1 ]]; then
+    userdel "$SANDBOX_USER" 2>/dev/null && info "user $SANDBOX_USER removed"
+    rm -rf /etc/pi-cell && info "removed /etc/pi-cell"
+    info "state dir left in place (delete manually if wanted)"
+  else
+    info "state/config left in place (use --purge to remove user and config)"
+  fi
+}
+
+cmd_grant_auth() {
+  need_root
+  load_config
+  grant_auth_access
+}
+
+# ------------------------------------------------------------------ chown
+cmd_chown() {
+  need_root
+  load_config
+  local realuser="${SUDO_USER:-root}"
+  info "handing $REPO back to $realuser (state volume stays sandbox-owned; delete $STATE_DIR to reset it)"
+  chown -R "$realuser:$realuser" "$REPO"
+}
+
+# ------------------------------------------------------------------ check
+cmd_check() {
+  local ok=1
+  for b in bwrap nft setfacl; do
+    if command -v "$b" >/dev/null 2>&1; then echo "$b: OK"; else echo "$b: MISSING (sudo apt install bubblewrap nftables acl)"; ok=0; fi
+  done
+  if unshare -Ur true 2>/dev/null; then echo "user namespaces: OK"; else echo "user namespaces: BLOCKED"; ok=0; fi
+  if getent passwd "$SANDBOX_USER" >/dev/null 2>&1; then echo "user $SANDBOX_USER: OK"; else echo "user $SANDBOX_USER: missing (run setup)"; ok=0; fi
+  if [[ -r $CONF ]]; then echo "config: OK ($CONF)"; else echo "config: missing (run setup)"; ok=0; fi
+  if [[ -r $SECRETS ]]; then echo "secrets: OK ($SECRETS)"; else echo "secrets: missing (run setup)"; ok=0; fi
+  if command -v nft >/dev/null 2>&1 && nft list table inet pi-cell >/dev/null 2>&1; then
+    echo "nftables ruleset: loaded"
+  else
+    echo "nftables ruleset: not loaded (run setup as root)"
+  fi
+  [[ $ok == 1 ]] && echo "all checks passed — run: sudo pi-cell run" || echo "resolve the issues above, then re-run check"
+}
+
+# ------------------------------------------------------------------ main
+case "${1:-help}" in
+  setup)    shift; [[ ${1:-} == --install ]] && INSTALL_DEPS=1; cmd_setup ;;
+  run)      shift; [[ ${1:-} == --dry-run ]] && DRY_RUN=1 && shift; cmd_run "$@" ;;
+  grant-auth) cmd_grant_auth ;;
+  teardown) shift; [[ ${1:-} == --purge ]] && PURGE=1; cmd_teardown ;;
+  chown)    cmd_chown ;;
+  check)    cmd_check ;;
+  help|-h|--help)
+    sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+  *) die "unknown command: $1 (try: setup | run | teardown | chown | check | help)" ;;
+esac
