@@ -9,6 +9,7 @@
 #                                   launch pi in the sandbox (TUI, or `-p` for scripts)
 #   sudo pi-cell grant-auth       (re-)grant ACLs so host auth.json is live in the sandbox
 #   sudo pi-cell chown              hand repo files back to the real user
+#   sudo pi-cell rm-cell NAME       delete one cell's HOME (sessions, caches)
 #   sudo pi-cell teardown [--purge] remove the nftables ruleset (and user/config)
 #   pi-cell check                   non-root prerequisite check
 #
@@ -487,6 +488,20 @@ cmd_grant_auth() {
   grant_auth_access
 }
 
+# --------------------------------------------------------------- rm-cell
+cmd_rm_cell() {
+  need_root
+  load_config
+  local name="${1:-}"
+  [[ -n $name ]] || die "usage: pi-cell rm-cell <name>"
+  [[ $name =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "invalid cell name: $name"
+  local d="$STATE_DIR/cells/$name"
+  [[ $d == "$STATE_DIR/cells/"* ]] || die "refusing to remove: $d"
+  [[ -d $d && ! -L $d ]] || die "no such cell: $name"
+  rm -rf -- "$d"
+  info "cell $name removed ($d)"
+}
+
 # ------------------------------------------------------------------ chown
 cmd_chown() {
   need_root
@@ -545,6 +560,7 @@ case "${1:-help}" in
   grant-auth) cmd_grant_auth ;;
   teardown) shift; [[ ${1:-} == --purge ]] && PURGE=1; cmd_teardown ;;
   chown)    cmd_chown ;;
+  rm-cell)  shift; cmd_rm_cell "$@" ;;
   check)    cmd_check ;;
   help|-h|--help)
     sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
