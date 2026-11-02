@@ -348,8 +348,26 @@ EOF
 }
 
 # --------------------------------------------------------------- teardown
+revoke_grants() {
+  # ACLs are re-granted on every run/setup, so drop them when we stop using
+  # them: they are numeric, and a later account reusing this uid would
+  # otherwise inherit read on auth.json/secrets and rwx on the repo.
+  local p
+  for p in "$HOST_PI_AGENT" "$HOST_PI_AGENT/auth.json" "$SECRETS"; do
+    [[ -e $p ]] || continue
+    setfacl -x "u:$SANDBOX_USER" "$p" 2>/dev/null || true
+  done
+  if [[ -d ${REPO:-} ]]; then
+    setfacl -R -x "u:$SANDBOX_USER" -- "$REPO" 2>/dev/null || true
+    setfacl -R -x "d:u:$SANDBOX_USER" -- "$REPO" 2>/dev/null || true
+  fi
+  return 0
+}
+
 cmd_teardown() {
   need_root
+  # revoke before (possibly) removing the user, while the name still resolves
+  ( load_config && revoke_grants ) 2>/dev/null || info "ACLs not revoked (config/paths unavailable)"
   if nft delete table inet pi-cell 2>/dev/null; then
     info "nftables ruleset removed"
   else

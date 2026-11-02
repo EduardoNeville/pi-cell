@@ -34,7 +34,7 @@ sudo pi-cell run
 
 # later: hand files back to you after a session, or remove the ruleset
 sudo pi-cell chown
-sudo pi-cell teardown             # add --purge to also remove user + config
+sudo pi-cell teardown             # revokes ACLs; --purge removes user + config
 ```
 
 `check` runs without root: `pi-cell check`.
