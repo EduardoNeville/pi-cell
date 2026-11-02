@@ -1,0 +1,9 @@
+[Unit]
+Description=Start pi cells when a job is dropped in the spool
+
+[Path]
+PathExistsGlob=/srv/pi-cell/spool/*/job.prompt
+Unit=pi-cell-start.service
+
+[Install]
+WantedBy=multi-user.target

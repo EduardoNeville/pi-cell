@@ -54,6 +54,17 @@ echo "exit=$?"          # pi's exit code
   pi sessions, `auth.json` bind target and bun cache, so several cells can run
   at once. Without it `HOME` is `/state` — one long-lived cell, as before.
   Names must match `[A-Za-z0-9][A-Za-z0-9_.-]*`.
+- **`--repo NAME`** binds `$REPO_ROOT/NAME` as `/workspace`, so one install
+  serves many projects (one repo per job). `NAME` is a single directory
+  component; `REPO_ROOT` is root-configured and setup applies the ACLs to it so
+  job dirs created later inherit them.
+- **`--prompt-file PATH`** takes the prompt from a file instead of argv: it is
+  staged into the cell and never appears in the host's `/proc/*/cmdline`, and a
+  prompt starting with `-` cannot parse as a flag.
+- **`--timeout SECONDS`** kills the cell's process group (exit code 124) so a
+  hung job cannot hold the queue.
+- **`rm-cell NAME`** deletes one cell's `HOME` — needed because
+  `/state/cells/*` is sandbox-owned and only root can prune it.
 - **Nothing else comes from the caller.** Repo, mounts and egress policy stay
   root-configured on purpose: a user-chosen `--repo` would be a privilege
   expansion, not a convenience.
@@ -65,6 +76,29 @@ echo "exit=$?"          # pi's exit code
 - **Parallel cells on one repo** should each use a `git worktree`. They share
   the `pi-sandbox` uid and a single egress policy: they are separated by
   mount/pid/ipc namespaces and per-cell `HOME`, not by uid.
+
+### From a container
+
+A container cannot sudo, so it submits work through a directory it already has
+mounted. `contrib/` is the host side of that: one dispatcher, two path units.
+
+```
+spool/<id>/job.prompt   -> start a cell for repo <id>   (serial, one at a time)
+spool/<id>/cancel       -> stop that cell
+```
+
+```bash
+sudo install -m 0755 contrib/spool/pi-cell-spool /usr/local/bin/
+sudo install -m 0644 contrib/systemd/pi-cell-*.path \
+                    contrib/systemd/pi-cell-*.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now pi-cell-start.path pi-cell-cancel.path
+```
+
+The result is not returned over a socket: the cell writes into its repo
+(`status.json`, `render.mp4`), the same channel the caller already watches, and
+the exit status lands in `journalctl -u pi-cell-job-<id>`. Nothing new is
+exposed — the container only writes into a directory under `REPO_ROOT`.
 
 ## Trust boundary
 

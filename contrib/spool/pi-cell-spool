@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+#
+# pi-cell-spool — example host-side glue for callers that cannot sudo.
+#
+# A container submits work by dropping files into a spool directory it already
+# has mounted (a directory under REPO_ROOT, not a new socket):
+#
+#   $SPOOL/<id>/job.prompt   start a cell for repo <id>
+#   $SPOOL/<id>/cancel       stop that cell
+#
+# Two systemd path units watch the spool and run this script (see
+# contrib/systemd). The result is not returned here: the cell writes into its
+# repo (status.json, render.mp4), which is the channel the caller already
+# watches. Exit status lands in the journal:
+#
+#   journalctl -u pi-cell-job-<id>
+#
+set -euo pipefail
+
+SPOOL="${PICELL_SPOOL:-/srv/pi-cell/spool}"
+PICELL="${PICELL:-/usr/local/bin/pi-cell}"
+UNIT=pi-cell-job
+TIMEOUT="${PICELL_JOB_TIMEOUT:-5400}"
+
+die() { echo "pi-cell-spool: $*" >&2; exit 1; }
+
+case "${1:-}" in
+start)
+  # Drain the spool one job at a time. Serial on purpose: two renders at once
+  # are slower than two queued renders, and the caller's quota is shared.
+  # Re-scan after each job so prompts that arrived meanwhile are not lost.
+  while :; do
+    pending=()
+    for f in "$SPOOL"/*/job.prompt; do [[ -e $f ]] && pending+=("$f"); done
+    ((${#pending[@]})) || break
+    for f in "${pending[@]}"; do
+      id=$(basename "$(dirname "$f")")
+      [[ $id =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] \
+        || { echo "skip bad id: $id" >&2; mv -- "$f" "$f.rejected"; continue; }
+      # move first: the path unit must see the glob go empty, or a second job
+      # would never trigger it
+      mv -- "$f" "$f.running"
+      systemd-run --wait --collect --quiet --unit="$UNIT-$id" \
+        "$PICELL" run --repo "$id" --cell "job-$id" --timeout "$TIMEOUT" \
+        --prompt-file "$f.running" || echo "job $id exited non-zero" >&2
+      rm -f -- "$f.running"
+    done
+  done
+  ;;
+cancel)
+  for f in "$SPOOL"/*/cancel; do
+    [[ -e $f ]] || continue
+    id=$(basename "$(dirname "$f")")
+    systemctl stop "$UNIT-$id" 2>/dev/null || true
+    rm -f -- "$f"
+    echo "stopped $UNIT-$id"
+  done
+  ;;
+*)
+  die "usage: $0 start|cancel"
+  ;;
+esac

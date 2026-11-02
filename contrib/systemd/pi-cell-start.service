@@ -1,0 +1,9 @@
+[Unit]
+Description=pi-cell spool dispatcher (start)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pi-cell-spool start
+# the cells are transient units of their own: stopping the dispatcher must not
+# kill a running cell, and stopping a cell must not touch the dispatcher
+KillMode=process

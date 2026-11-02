@@ -1,0 +1,9 @@
+[Unit]
+Description=Stop a pi cell when its cancel file appears
+
+[Path]
+PathExistsGlob=/srv/pi-cell/spool/*/cancel
+Unit=pi-cell-cancel.service
+
+[Install]
+WantedBy=multi-user.target

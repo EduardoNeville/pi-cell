@@ -1,0 +1,6 @@
+[Unit]
+Description=pi-cell spool dispatcher (cancel)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pi-cell-spool cancel
