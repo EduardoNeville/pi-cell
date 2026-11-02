@@ -43,6 +43,17 @@ load_config() {
   [[ -d $REPO ]]        || die "REPO is not a directory: $REPO"
   [[ -d $STATE_DIR ]]   || die "STATE_DIR is not a directory (run: sudo pi-cell setup): $STATE_DIR"
   [[ -d $BUN_HOST_DIR ]] || die "BUN_HOST_DIR is not a directory: $BUN_HOST_DIR"
+  # resolve first, then refuse paths the sandbox can turn into a symlink: /state
+  # is sandbox-writable, so a bind of "$STATE_DIR/x" could become a bind of /
+  REPO=$(realpath -e -- "$REPO")             || die "cannot resolve REPO: $REPO"
+  STATE_DIR=$(realpath -e -- "$STATE_DIR")   || die "cannot resolve STATE_DIR: $STATE_DIR"
+  BUN_HOST_DIR=$(realpath -e -- "$BUN_HOST_DIR") || die "cannot resolve BUN_HOST_DIR: $BUN_HOST_DIR"
+  [[ $STATE_DIR != / ]] || die "STATE_DIR must not be / (setup would chown the world)"
+  local v
+  for v in REPO BUN_HOST_DIR; do
+    [[ ${!v} != "$STATE_DIR"/* ]] \
+      || die "$v must not live under STATE_DIR: the sandbox could replace it with a symlink"
+  done
   DB_ADDR="${DB_ADDR:-}"
   DB_PORT="${DB_PORT:-5432}"
   EXTRA_PORTS="${EXTRA_PORTS:-}"
@@ -226,6 +237,7 @@ cmd_setup() {
     REPO=""
   fi
   [[ -d $STATE_DIR ]] || install -d -m 0700 -o "$SANDBOX_USER" -g "$SANDBOX_USER" "$STATE_DIR"
+  [[ $(realpath -e -- "$STATE_DIR") != / ]] || die "STATE_DIR must not be /"
 
   # host pi agent dir (used for auth.json source of truth)
   if [[ -n ${PI_AGENT_DIR:-} ]]; then
