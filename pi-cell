@@ -142,6 +142,12 @@ cmd_run() {
     [[ $REPO == "$REPO_ROOT"/* ]] || die "--repo escapes REPO_ROOT: $JOB_REPO"
   fi
 
+  if [[ -n ${PROMPT_FILE:-} ]]; then
+    local pf
+    pf=$(realpath -e -- "$PROMPT_FILE" 2>/dev/null) || die "no such --prompt-file: $PROMPT_FILE"
+    PROMPT_FILE=$pf
+  fi
+
   # one HOME per cell, so concurrent cells do not share pi sessions, auth.json
   # or bun's cache. No --cell = one long-lived cell in /state (as before).
   local cell_home=/state
@@ -160,6 +166,9 @@ cmd_run() {
     ensure_state_agent "$cell_dir"
     grant_auth_access   # ACLs so the real host auth.json can be bind-mounted (no copy)
     grant_secrets_access
+    # stage the prompt into the cell dir so the sandbox can read it whatever the
+    # original's ownership is (and so it cannot change under us mid-run)
+    [[ -n ${PROMPT_FILE:-} ]] && install -m 0644 -- "$PROMPT_FILE" "$cell_dir/prompt.txt"
   fi
 
   local bwrap=(bwrap --die-with-parent
@@ -221,6 +230,9 @@ cmd_run() {
 
   # secrets live in a root-only file, bound read-only and sourced by the wrapper
   [[ -f $SECRETS ]] && bwrap+=(--ro-bind "$SECRETS" /run/secrets.env)
+  # the prompt is a file, never argv: a user's paper text must not show up in the
+  # host's /proc/*/cmdline, and a prompt starting with "-" must not parse as a flag
+  [[ -n ${PROMPT_FILE:-} ]] && bwrap+=(--ro-bind "$cell_dir/prompt.txt" /run/prompt.txt)
 
   [[ -z $GIT_NAME  ]] || bwrap+=(--setenv GIT_AUTHOR_NAME "$GIT_NAME" --setenv GIT_COMMITTER_NAME "$GIT_NAME")
   [[ -z $GIT_EMAIL ]] || bwrap+=(--setenv GIT_AUTHOR_EMAIL "$GIT_EMAIL" --setenv GIT_COMMITTER_EMAIL "$GIT_EMAIL")
@@ -232,8 +244,9 @@ cmd_run() {
 
   info "launching pi in sandbox (workspace=$REPO home=$cell_home egress=DNS+443+db:${DB_PORT})"
   # umask 002 + ACLs so files created by the sandbox stay editable by you.
+  # shellcheck disable=SC2016  # $@ and $(cat) expand in the sandbox's sh, not here
   local cmd=(sudo -u "$SANDBOX_USER" "${bwrap[@]}" -- \
-    /bin/sh -c 'umask 002; [ -r /run/secrets.env ] && { set -a; . /run/secrets.env; set +a; }; exec "$@"' \
+    /bin/sh -c 'umask 002; [ -r /run/secrets.env ] && { set -a; . /run/secrets.env; set +a; }; [ -s /run/prompt.txt ] && set -- "$@" -p "$(cat /run/prompt.txt)"; exec "$@"' \
       pi /bun/bin/pi "${pi_args[@]}" "$@")
   if [[ ${DRY_RUN:-0} == 1 ]]; then
     printf '%q ' "${cmd[@]}"; echo; exit 0
@@ -505,6 +518,7 @@ case "${1:-help}" in
         --dry-run) DRY_RUN=1; shift ;;
         --cell)    CELL="${2:-}"; [[ -n $CELL ]] || die "--cell needs a name"; shift 2 ;;
         --repo)    JOB_REPO="${2:-}"; [[ -n $JOB_REPO ]] || die "--repo needs a name"; shift 2 ;;
+        --prompt-file) PROMPT_FILE="${2:-}"; [[ -n $PROMPT_FILE ]] || die "--prompt-file needs a path"; shift 2 ;;
         --)        shift; break ;;
         *)         break ;;
       esac
