@@ -244,8 +244,14 @@ cmd_run() {
 
   info "launching pi in sandbox (workspace=$REPO home=$cell_home egress=DNS+443+db:${DB_PORT})"
   # umask 002 + ACLs so files created by the sandbox stay editable by you.
+  # --timeout kills the whole process group, so a hung render cannot hold the queue
+  local tmo=()
+  if [[ -n ${TIMEOUT:-} ]]; then
+    [[ $TIMEOUT =~ ^[0-9]+$ ]] || die "--timeout wants seconds, got: $TIMEOUT"
+    tmo=(timeout --kill-after=30 "$TIMEOUT")
+  fi
   # shellcheck disable=SC2016  # $@ and $(cat) expand in the sandbox's sh, not here
-  local cmd=(sudo -u "$SANDBOX_USER" "${bwrap[@]}" -- \
+  local cmd=("${tmo[@]}" sudo -u "$SANDBOX_USER" "${bwrap[@]}" -- \
     /bin/sh -c 'umask 002; [ -r /run/secrets.env ] && { set -a; . /run/secrets.env; set +a; }; [ -s /run/prompt.txt ] && set -- "$@" -p "$(cat /run/prompt.txt)"; exec "$@"' \
       pi /bun/bin/pi "${pi_args[@]}" "$@")
   if [[ ${DRY_RUN:-0} == 1 ]]; then
@@ -519,6 +525,7 @@ case "${1:-help}" in
         --cell)    CELL="${2:-}"; [[ -n $CELL ]] || die "--cell needs a name"; shift 2 ;;
         --repo)    JOB_REPO="${2:-}"; [[ -n $JOB_REPO ]] || die "--repo needs a name"; shift 2 ;;
         --prompt-file) PROMPT_FILE="${2:-}"; [[ -n $PROMPT_FILE ]] || die "--prompt-file needs a path"; shift 2 ;;
+        --timeout) TIMEOUT="${2:-}"; [[ -n $TIMEOUT ]] || die "--timeout needs seconds"; shift 2 ;;
         --)        shift; break ;;
         *)         break ;;
       esac
