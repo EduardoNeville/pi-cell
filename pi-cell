@@ -64,6 +64,7 @@ load_config() {
     [[ $REPO_ROOT != "$STATE_DIR"/* ]] || die "REPO_ROOT must not live under STATE_DIR"
   fi
   EXTRA_PORTS="${EXTRA_PORTS:-}"
+  EXTRA_RO_BINDS="${EXTRA_RO_BINDS:-}"
   PI_ARGS="${PI_ARGS:-}"
   GIT_NAME="${GIT_NAME:-}"
   GIT_EMAIL="${GIT_EMAIL:-}"
@@ -193,6 +194,20 @@ cmd_run() {
   local resolv
   resolv=$(readlink -f /etc/resolv.conf 2>/dev/null || true)
   [[ -n $resolv && $resolv != /etc/resolv.conf ]] && bwrap+=(--ro-bind "$resolv" "$resolv")
+  # extra read-only inputs, mounted at their identical host paths: a project's
+  # shared symlinks (docs/, .venv, assets/) point at host paths, which the
+  # /workspace layout does not provide.
+  local b p
+  for b in ${EXTRA_RO_BINDS:-}; do
+    p=$(realpath -e -- "$b" 2>/dev/null) || die "EXTRA_RO_BINDS path missing: $b"
+    b=$p
+    case $b in
+      /|/workspace|/state|/bun|/proc|/dev|/sys|/etc|/usr|/tmp|/run|/bin|/sbin|/lib|/lib64)
+        die "EXTRA_RO_BINDS must not shadow a sandbox path: $b" ;;
+    esac
+    [[ $b != "$STATE_DIR"/* ]] || die "EXTRA_RO_BINDS must not live under STATE_DIR"
+    bwrap+=(--ro-bind "$b" "$b")
+  done
   [[ $ALLOW_NESTED_USERNS == 1 ]] || bwrap+=(--disable-userns)
 
   # live bind-mount of the host's real auth.json (no copy):
@@ -303,6 +318,10 @@ ALLOW_NESTED_USERNS=0
 DB_ADDR=            # leave empty for "any host", or e.g. 10.0.0.5
 DB_PORT=5432
 EXTRA_PORTS=        # comma list, e.g. 3000,8080 (all destinations)
+# Optional: extra read-only paths mounted at their identical host paths (space
+# separated, no spaces in the paths). For projects whose symlinks point into a
+# shared workspace (docs/, .venv, assets/).
+EXTRA_RO_BINDS=
 # Optional git identity injected as env vars (so agent commits are attributed):
 GIT_NAME=
 GIT_EMAIL=
