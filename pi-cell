@@ -56,7 +56,9 @@ load_config() {
       || die "$v must not live under STATE_DIR: the sandbox could replace it with a symlink"
   done
   DB_ADDR="${DB_ADDR:-}"
-  DB_PORT="${DB_PORT:-5432}"
+  DB_PORT="${DB_PORT:-}"   # empty = the cell gets no DB access at all
+  [[ -z $DB_PORT ]] || [[ $DB_PORT =~ ^[0-9]+$ ]] || die "DB_PORT is not a port: $DB_PORT"
+  [[ -z $DB_ADDR ]] || [[ $DB_ADDR =~ ^[0-9a-fA-F.:]+$ ]] || die "DB_ADDR is not an address: $DB_ADDR"
   REPO_ROOT="${REPO_ROOT:-}"
   if [[ -n $REPO_ROOT ]]; then
     [[ -d $REPO_ROOT ]] || die "REPO_ROOT is not a directory: $REPO_ROOT"
@@ -242,7 +244,7 @@ cmd_run() {
   local pi_args=()
   read -r -a pi_args <<< "$PI_ARGS"   # split config PI_ARGS on whitespace
 
-  info "launching pi in sandbox (workspace=$REPO home=$cell_home egress=DNS+443+db:${DB_PORT})"
+  info "launching pi in sandbox (workspace=$REPO home=$cell_home egress=DNS+443+db:${DB_PORT:-off})"
   # umask 002 + ACLs so files created by the sandbox stay editable by you.
   # --timeout kills the whole process group, so a hung render cannot hold the queue
   local tmo=()
@@ -334,8 +336,11 @@ AUTH_MODE=ro
 # e.g. Claude Code's Linux sandbox). 0 = block nested userns (smaller kernel surface).
 ALLOW_NESTED_USERNS=0
 # Egress beyond DNS + TLS:443 (all optional):
-DB_ADDR=            # leave empty for "any host", or e.g. 10.0.0.5
-DB_PORT=5432
+# Database access from the cell: leave BOTH empty to deny it entirely (default).
+# DB_ADDR scopes it to one host (empty = any host, including 127.0.0.1);
+# DB_PORT enables it, e.g. DB_PORT=5432.
+DB_ADDR=
+DB_PORT=
 EXTRA_PORTS=        # comma list, e.g. 3000,8080 (all destinations)
 # Optional: extra read-only paths mounted at their identical host paths (space
 # separated, no spaces in the paths). For projects whose symlinks point into a
@@ -371,15 +376,21 @@ SEC
 
   # 6. nftables ruleset (egress + inbound, restricted to the sandbox uid)
   local db_rule=""
-  if [[ -n $DB_ADDR ]]; then
-    db_rule="    meta skuid $uid ip daddr $DB_ADDR tcp dport ${DB_PORT:-5432} accept"
-  else
-    db_rule="    meta skuid $uid tcp dport ${DB_PORT:-5432} accept"
+  if [[ -n $DB_PORT ]]; then
+    if [[ -n $DB_ADDR ]]; then
+      local fam=ip
+      [[ $DB_ADDR == *:* ]] && fam=ip6
+      db_rule="    meta skuid $uid $fam daddr $DB_ADDR tcp dport $DB_PORT accept"
+    else
+      db_rule="    meta skuid $uid tcp dport $DB_PORT accept"
+    fi
   fi
   local extra_rules=""
   local p
   for p in ${EXTRA_PORTS//,/ }; do
-    [[ -n $p ]] && extra_rules+="    meta skuid $uid tcp dport $p accept"$'\n'
+    [[ -z $p ]] && continue
+    [[ $p =~ ^[0-9]+$ ]] || die "EXTRA_PORTS has a non-port: $p"
+    extra_rules+="    meta skuid $uid tcp dport $p accept"$'\n'
   done
   info "writing nftables ruleset ($NFT)"
   cat > "$NFT" <<EOF
