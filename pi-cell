@@ -119,6 +119,7 @@ grant_secrets_access() {
 
 # ------------------------------------------------------------------ run
 cmd_run() {
+  [[ ${1:-} == -- ]] && shift   # allow `pi-cell run -- --model x`
   [[ ${DRY_RUN:-0} == 1 ]] || need_root
   load_config
 
@@ -425,6 +426,8 @@ cmd_check() {
     for d in bin lib lib64; do [[ -e /$d ]] && t+=(--ro-bind "/$d" "/$d"); done
     if "${t[@]}" -- /bin/sh -c true 2>/dev/null; then echo "bwrap smoke test: OK"
     else echo "bwrap smoke test: FAILED (argv/mounts broken)"; ok=0; fi
+    if bwrap --help 2>&1 | grep -q -- --disable-userns; then echo "bwrap --disable-userns: OK"
+    else echo "bwrap --disable-userns: unsupported (bwrap >= 0.8 needed, or set ALLOW_NESTED_USERNS=1)"; ok=0; fi
   fi
   if [[ -r $CONF ]]; then echo "config: OK ($CONF)"; else echo "config: missing (run setup)"; ok=0; fi
   if [[ -r $SECRETS ]]; then echo "secrets: OK ($SECRETS)"; else echo "secrets: missing (run setup)"; ok=0; fi
