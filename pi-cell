@@ -5,7 +5,8 @@
 #   sudo pi-cell setup [--install]  one-time: deps check, sandbox user, state dir,
 #                                   config + secrets placeholders, nftables egress
 #                                   ruleset, repo ACLs
-#   sudo pi-cell run [-- args...]   launch pi inside the sandbox (interactive TUI)
+#   sudo pi-cell run [--dry-run] [--cell NAME] [-- args...]
+#                                   launch pi in the sandbox (TUI, or `-p` for scripts)
 #   sudo pi-cell grant-auth       (re-)grant ACLs so host auth.json is live in the sandbox
 #   sudo pi-cell chown              hand repo files back to the real user
 #   sudo pi-cell teardown [--purge] remove the nftables ruleset (and user/config)
@@ -29,7 +30,7 @@ readonly NFT="${PICELL_NFT:-/etc/pi-cell/pi-cell.nft}"
 readonly SANDBOX_USER=pi-sandbox
 
 die()  { echo "pi-cell: error: $*" >&2; exit 1; }
-info() { echo "pi-cell: $*"; }
+info() { echo "pi-cell: $*" >&2; }   # stdout belongs to the agent
 need_root() { [[ $(id -u) == 0 ]] || die "this command needs root (run with sudo)"; }
 
 # ---------------------------------------------------------------- config
@@ -75,12 +76,14 @@ load_config() {
 ensure_state_agent() {
   # the sandbox's ~/.pi/agent; the auth.json placeholder is where the host's
   # real auth.json gets bind-mounted (target must exist before the bind)
-  local agent="$STATE_DIR/.pi/agent"
+  local base="${1:-$STATE_DIR}"
+  local agent="$base/.pi/agent"
   local target="$agent/auth.json"
   # /state is sandbox-writable: never let root follow a planted symlink out of it
-  [[ -L $STATE_DIR/.pi || -L $agent || -L $target ]] \
+  [[ -L $base || -L $STATE_DIR/cells || -L $agent || -L $target ]] \
     && die "refusing: symlink under $agent (state is sandbox-writable)"
   mkdir -p "$agent"
+  chown "$SANDBOX_USER:$SANDBOX_USER" "$base" "$base/.pi"
   chown -R "$SANDBOX_USER:$SANDBOX_USER" "$agent"
   [[ -e $target ]] || install -m 0600 -o "$SANDBOX_USER" -g "$SANDBOX_USER" /dev/null "$target"
 }
@@ -119,16 +122,25 @@ grant_secrets_access() {
 
 # ------------------------------------------------------------------ run
 cmd_run() {
-  [[ ${1:-} == -- ]] && shift   # allow `pi-cell run -- --model x`
   [[ ${DRY_RUN:-0} == 1 ]] || need_root
   load_config
+
+  # one HOME per cell, so concurrent cells do not share pi sessions, auth.json
+  # or bun's cache. No --cell = one long-lived cell in /state (as before).
+  local cell_home=/state
+  local cell_dir="$STATE_DIR"
+  if [[ -n ${CELL:-} ]]; then
+    [[ $CELL =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "invalid cell name: $CELL"
+    cell_home="/state/cells/$CELL"
+    cell_dir="$STATE_DIR/cells/$CELL"
+  fi
 
   if [[ ${DRY_RUN:-0} != 1 ]]; then
     # fail closed: no egress policy, no sandbox
     nft list table inet pi-cell >/dev/null 2>&1 || nft -f "$NFT" 2>/dev/null || true
     nft list table inet pi-cell >/dev/null 2>&1 \
       || die "egress ruleset not loaded (run: sudo pi-cell setup)"
-    ensure_state_agent
+    ensure_state_agent "$cell_dir"
     grant_auth_access   # ACLs so the real host auth.json can be bind-mounted (no copy)
     grant_secrets_access
   fi
@@ -148,11 +160,11 @@ cmd_run() {
     --size 536870912 --tmpfs /dev/shm
     --clearenv
     --setenv PATH /bun/bin:/usr/local/bin:/usr/bin:/bin
-    --setenv HOME /state
+    --setenv HOME "$cell_home"
     --setenv TERM "${TERM:-xterm-256color}"
     --setenv LANG "${LANG:-C.UTF-8}"
     --setenv BUN_INSTALL /bun
-    --setenv BUN_INSTALL_CACHE_DIR /state/bun-cache)
+    --setenv BUN_INSTALL_CACHE_DIR "$cell_home/bun-cache")
 
   # only /usr is bound, so the usrmerge dirs have to be mounted explicitly:
   # /bin/sh is what the umask wrapper execs, /lib* is what it links against.
@@ -170,9 +182,9 @@ cmd_run() {
   # live bind-mount of the host's real auth.json (no copy):
   if [[ -f $HOST_PI_AGENT/auth.json ]]; then
     if [[ $AUTH_MODE == rw ]]; then
-      bwrap+=(--bind "$HOST_PI_AGENT/auth.json" /state/.pi/agent/auth.json)
+      bwrap+=(--bind "$HOST_PI_AGENT/auth.json" "$cell_home/.pi/agent/auth.json")
     else
-      bwrap+=(--ro-bind "$HOST_PI_AGENT/auth.json" /state/.pi/agent/auth.json)
+      bwrap+=(--ro-bind "$HOST_PI_AGENT/auth.json" "$cell_home/.pi/agent/auth.json")
     fi
   fi
 
@@ -187,7 +199,7 @@ cmd_run() {
   local pi_args=()
   read -r -a pi_args <<< "$PI_ARGS"   # split config PI_ARGS on whitespace
 
-  info "launching pi in sandbox (workspace=$REPO state=$STATE_DIR egress=DNS+443+db:${DB_PORT})"
+  info "launching pi in sandbox (workspace=$REPO home=$cell_home egress=DNS+443+db:${DB_PORT})"
   # umask 002 + ACLs so files created by the sandbox stay editable by you.
   local cmd=(sudo -u "$SANDBOX_USER" "${bwrap[@]}" -- \
     /bin/sh -c 'umask 002; [ -r /run/secrets.env ] && { set -a; . /run/secrets.env; set +a; }; exec "$@"' \
@@ -442,7 +454,17 @@ cmd_check() {
 # ------------------------------------------------------------------ main
 case "${1:-help}" in
   setup)    shift; [[ ${1:-} == --install ]] && INSTALL_DEPS=1; cmd_setup ;;
-  run)      shift; [[ ${1:-} == --dry-run ]] && DRY_RUN=1 && shift; cmd_run "$@" ;;
+  run)
+    shift
+    while [[ $# -gt 0 ]]; do
+      case $1 in
+        --dry-run) DRY_RUN=1; shift ;;
+        --cell)    CELL="${2:-}"; [[ -n $CELL ]] || die "--cell needs a name"; shift 2 ;;
+        --)        shift; break ;;
+        *)         break ;;
+      esac
+    done
+    cmd_run "$@" ;;
   grant-auth) cmd_grant_auth ;;
   teardown) shift; [[ ${1:-} == --purge ]] && PURGE=1; cmd_teardown ;;
   chown)    cmd_chown ;;

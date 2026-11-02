@@ -39,6 +39,33 @@ sudo pi-cell teardown             # revokes ACLs; --purge removes user + config
 
 `check` runs without root: `pi-cell check`.
 
+## Programmatic use
+
+`run` is a normal command, so a script or an orchestrator can drive it:
+
+```bash
+sudo -n pi-cell run --cell build-1 -- -p "run the tests and fix what fails"
+echo "exit=$?"          # pi's exit code
+```
+
+- **stdout is only the agent's output** — the launcher's own messages go to
+  stderr, so `$(...)` and JSON consumers are safe.
+- **`--cell NAME`** gives that run its own `HOME` (`/state/cells/NAME`): separate
+  pi sessions, `auth.json` bind target and bun cache, so several cells can run
+  at once. Without it `HOME` is `/state` — one long-lived cell, as before.
+  Names must match `[A-Za-z0-9][A-Za-z0-9_.-]*`.
+- **Nothing else comes from the caller.** Repo, mounts and egress policy stay
+  root-configured on purpose: a user-chosen `--repo` would be a privilege
+  expansion, not a convenience.
+- **Cancel** by killing the `sudo`/`pi-cell` process group; `--die-with-parent`
+  takes the sandbox down with it.
+- **Passwordless spawning**: one narrow sudoers line, pointing at a root-owned,
+  non-user-writable copy of the script — and never for `setup`/`teardown`/`chown`:
+  `you ALL=(root) NOPASSWD: /usr/local/bin/pi-cell run`
+- **Parallel cells on one repo** should each use a `git worktree`. They share
+  the `pi-sandbox` uid and a single egress policy: they are separated by
+  mount/pid/ipc namespaces and per-cell `HOME`, not by uid.
+
 ## Trust boundary
 
 | Path | Policy | Inside |
@@ -137,8 +164,9 @@ environment variables on the host — normally you can ignore it.
 - **DNS via Tailscale MagicDNS** works out of the box (it's just port 53).
 - **TUI & Ctrl-C** work through bwrap; if you ever hit a signal quirk, drop
   `--unshare-pid` in the `run` command.
-- **Extensions:** `~/.pi/agent` inside the sandbox starts fresh in `/state`.
-  Reinstall/copy your extensions there if you need them.
+- **Extensions:** `~/.pi/agent` inside the sandbox starts fresh in the cell's
+  `HOME` (`/state`, or `/state/cells/NAME` with `--cell`). Reinstall/copy your
+  extensions there if you need them.
 
 ## Upgrade path
 
