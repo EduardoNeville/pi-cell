@@ -18,8 +18,9 @@
 #
 # Mechanism: one long-lived sandbox (namespaces, no daemon) whose writable host
 # paths are exactly the two above. Network is shared but the nftables ruleset
-# restricts only the sandbox uid. API keys enter via --setenv from the root-only
-# secrets file; the egress ruleset is the exfiltration control.
+# restricts only the sandbox uid. Secrets are bind-mounted read-only and sourced
+# inside, never passed in argv. Egress is port-based, not destination-based: it
+# is NOT an exfiltration control (see README).
 set -euo pipefail
 
 readonly CONF="${PICELL_CONF:-/etc/pi-cell/config}"
@@ -49,6 +50,7 @@ load_config() {
   GIT_NAME="${GIT_NAME:-}"
   GIT_EMAIL="${GIT_EMAIL:-}"
   AUTH_MODE="${AUTH_MODE:-ro}"   # ro = sandbox reads host auth.json live; rw = sandbox can also write
+  ALLOW_NESTED_USERNS="${ALLOW_NESTED_USERNS:-0}"  # 1 = sandbox may create its own userns (inner bwrap / Claude Code)
   # host pi agent dir = source of truth for auth.json (config can override)
   if [[ -n ${PI_AGENT_DIR:-} ]]; then
     HOST_PI_AGENT=$PI_AGENT_DIR
@@ -62,13 +64,14 @@ load_config() {
 ensure_state_agent() {
   # the sandbox's ~/.pi/agent; the auth.json placeholder is where the host's
   # real auth.json gets bind-mounted (target must exist before the bind)
-  mkdir -p "$STATE_DIR/.pi/agent"
-  chown -R "$SANDBOX_USER:$SANDBOX_USER" "$STATE_DIR/.pi/agent"
-  local target="$STATE_DIR/.pi/agent/auth.json"
-  if [[ ! -e $target ]]; then
-    : > "$target"
-    chown "$SANDBOX_USER:$SANDBOX_USER" "$target"
-  fi
+  local agent="$STATE_DIR/.pi/agent"
+  local target="$agent/auth.json"
+  # /state is sandbox-writable: never let root follow a planted symlink out of it
+  [[ -L $STATE_DIR/.pi || -L $agent || -L $target ]] \
+    && die "refusing: symlink under $agent (state is sandbox-writable)"
+  mkdir -p "$agent"
+  chown -R "$SANDBOX_USER:$SANDBOX_USER" "$agent"
+  [[ -e $target ]] || install -m 0600 -o "$SANDBOX_USER" -g "$SANDBOX_USER" /dev/null "$target"
 }
 
 grant_auth_access() {
@@ -94,34 +97,33 @@ grant_auth_access() {
 }
 
 # --------------------------------------------------------------- secrets
-load_secrets() {
-  SECRET_ARGS=()
-  [[ -r $SECRETS ]] || { info "no secrets file — credentials come from the live auth.json bind"; return 0; }
-  while IFS= read -r line; do
-    line="${line%%#*}"                       # strip comments
-    line="${line#"${line%%[![:space:]]*}"}"  # trim leading whitespace
-    [[ -n $line ]] || continue
-    [[ $line == *=* ]] || continue
-    SECRET_ARGS+=(--setenv "${line%%=*}" "${line#*=}")
-  done < "$SECRETS"
+grant_secrets_access() {
+  # secrets.env is root-only; ACL just that file so the sandbox can read its
+  # bind-mounted copy. Nothing secret is passed in argv (world-readable
+  # /proc/*/cmdline) — the wrapper sources /run/secrets.env inside instead.
+  [[ -f $SECRETS ]] || return 0
+  setfacl -m "u:$SANDBOX_USER:r" "$SECRETS" 2>/dev/null \
+    || info "could not ACL $SECRETS (needs root)"
 }
 
 # ------------------------------------------------------------------ run
 cmd_run() {
   [[ ${DRY_RUN:-0} == 1 ]] || need_root
   load_config
-  load_secrets
 
   if [[ ${DRY_RUN:-0} != 1 ]]; then
+    # fail closed: no egress policy, no sandbox
+    nft list table inet pi-cell >/dev/null 2>&1 || nft -f "$NFT" 2>/dev/null || true
+    nft list table inet pi-cell >/dev/null 2>&1 \
+      || die "egress ruleset not loaded (run: sudo pi-cell setup)"
     ensure_state_agent
     grant_auth_access   # ACLs so the real host auth.json can be bind-mounted (no copy)
+    grant_secrets_access
   fi
 
   local bwrap=(bwrap --die-with-parent
     --unshare-user --unshare-pid --unshare-ipc --unshare-uts --share-net
     --ro-bind /usr /usr
-    --ro-bind /usr/local /usr/local
-    --ro-bind /opt /opt
     --ro-bind /etc /etc
     --ro-bind /sys /sys
     --ro-bind "$BUN_HOST_DIR" /bun
@@ -131,14 +133,27 @@ cmd_run() {
     --tmpfs /run
     --proc /proc
     --dev /dev
-    --tmpfs /dev/shm --size 536870912
+    --size 536870912 --tmpfs /dev/shm
     --clearenv
     --setenv PATH /bun/bin:/usr/local/bin:/usr/bin:/bin
     --setenv HOME /state
     --setenv TERM "${TERM:-xterm-256color}"
     --setenv LANG "${LANG:-C.UTF-8}"
     --setenv BUN_INSTALL /bun
-    "${SECRET_ARGS[@]}")
+    --setenv BUN_INSTALL_CACHE_DIR /state/bun-cache)
+
+  # only /usr is bound, so the usrmerge dirs have to be mounted explicitly:
+  # /bin/sh is what the umask wrapper execs, /lib* is what it links against.
+  local d
+  for d in usr/local opt bin sbin lib lib64; do
+    [[ -e /$d ]] && bwrap+=(--ro-bind "/$d" "/$d")
+  done
+  # resolv.conf is usually a symlink into /run, which is a tmpfs here: bind the
+  # real file at its real path so the symlink resolves inside the sandbox.
+  local resolv
+  resolv=$(readlink -f /etc/resolv.conf 2>/dev/null || true)
+  [[ -n $resolv && $resolv != /etc/resolv.conf ]] && bwrap+=(--ro-bind "$resolv" "$resolv")
+  [[ $ALLOW_NESTED_USERNS == 1 ]] || bwrap+=(--disable-userns)
 
   # live bind-mount of the host's real auth.json (no copy):
   if [[ -f $HOST_PI_AGENT/auth.json ]]; then
@@ -149,7 +164,8 @@ cmd_run() {
     fi
   fi
 
-  [[ -d /dev/pts ]] && bwrap+=(--dev-bind /dev/pts /dev/pts)
+  # secrets live in a root-only file, bound read-only and sourced by the wrapper
+  [[ -f $SECRETS ]] && bwrap+=(--ro-bind "$SECRETS" /run/secrets.env)
 
   [[ -z $GIT_NAME  ]] || bwrap+=(--setenv GIT_AUTHOR_NAME "$GIT_NAME" --setenv GIT_COMMITTER_NAME "$GIT_NAME")
   [[ -z $GIT_EMAIL ]] || bwrap+=(--setenv GIT_AUTHOR_EMAIL "$GIT_EMAIL" --setenv GIT_COMMITTER_EMAIL "$GIT_EMAIL")
@@ -162,7 +178,8 @@ cmd_run() {
   info "launching pi in sandbox (workspace=$REPO state=$STATE_DIR egress=DNS+443+db:${DB_PORT})"
   # umask 002 + ACLs so files created by the sandbox stay editable by you.
   local cmd=(sudo -u "$SANDBOX_USER" "${bwrap[@]}" -- \
-    /bin/sh -c 'umask 002; exec "$@"' pi /bun/bin/pi "${pi_args[@]}" "$@")
+    /bin/sh -c 'umask 002; [ -r /run/secrets.env ] && { set -a; . /run/secrets.env; set +a; }; exec "$@"' \
+      pi /bun/bin/pi "${pi_args[@]}" "$@")
   if [[ ${DRY_RUN:-0} == 1 ]]; then
     printf '%q ' "${cmd[@]}"; echo; exit 0
   fi
@@ -222,6 +239,7 @@ cmd_setup() {
   # sandbox's ~/.pi/agent: seeded from the host's auth.json, then sandbox-owned
   ensure_state_agent
   grant_auth_access
+  grant_secrets_access
 
   # 4. config + secrets placeholders
   if [[ ! -e $CONF ]]; then
@@ -234,6 +252,9 @@ BUN_HOST_DIR=/home/eduardoneville/.bun
 PI_AGENT_DIR=
 # auth.json mount: ro (default, sandbox reads host file live) | rw (sandbox can also write)
 AUTH_MODE=ro
+# 1 = let the sandbox create its own user namespaces (needed for an inner bwrap,
+# e.g. Claude Code's Linux sandbox). 0 = block nested userns (smaller kernel surface).
+ALLOW_NESTED_USERNS=0
 # Egress beyond DNS + TLS:443 (all optional):
 DB_ADDR=            # leave empty for "any host", or e.g. 10.0.0.5
 DB_PORT=5432
@@ -253,17 +274,17 @@ CFG
 # pi-cell secrets — OPTIONAL. Credentials normally come from the live bind of
 # the host's auth.json. Add KEY=VALUE lines here only for providers you
 # configure via environment variables on the host and want inside the sandbox.
+# This file is shell syntax (it is sourced inside the sandbox): quote values
+# that contain spaces, '#' or '$'. It is bind-mounted read-only at
+# /run/secrets.env, never passed in argv.
 # Example: OPENAI_API_KEY=sk-...
 SEC
     chmod 0600 "$SECRETS"
     info "wrote optional $SECRETS (only needed for env-configured providers)"
   fi
 
-  # 5. bun cache inside the writable state (host ~/.bun is mounted read-only)
-  cat > "$STATE_DIR/bunfig.toml" <<'BUN'
-[install]
-cacheDir = "/state/bun-cache"
-BUN
+  # 5. state volume ownership (bun's cache is set via BUN_INSTALL_CACHE_DIR at
+  #    run time — the host ~/.bun is read-only, so the default cache would fail)
   chown -R "$SANDBOX_USER:$SANDBOX_USER" "$STATE_DIR"
 
   # 6. nftables ruleset (egress + inbound, restricted to the sandbox uid)
@@ -283,18 +304,21 @@ BUN
 table inet pi-cell {
   chain output {
     type filter hook output priority 0; policy accept;
-    meta skuid $uid ct state established,related accept
+    meta skuid $uid ct state established,related ct direction original accept
+    meta skuid $uid ct state established ct direction reply oif "lo" accept
     meta skuid $uid udp dport 53 accept
     meta skuid $uid tcp dport 53 accept
     meta skuid $uid tcp dport 443 accept
 $db_rule
 ${extra_rules}    meta skuid $uid drop
   }
+  # Inbound cannot be filtered per-uid on a shared netns (and policy drop here
+  # would firewall the whole host), so the reverse channel is closed in output
+  # above: replies are only allowed on flows this uid started, or on loopback.
   chain input {
     type filter hook input priority 0; policy accept;
     ct state established,related accept
     iif "lo" accept
-    meta skuid $uid drop
   }
 }
 EOF
@@ -363,6 +387,15 @@ cmd_check() {
   done
   if unshare -Ur true 2>/dev/null; then echo "user namespaces: OK"; else echo "user namespaces: BLOCKED"; ok=0; fi
   if getent passwd "$SANDBOX_USER" >/dev/null 2>&1; then echo "user $SANDBOX_USER: OK"; else echo "user $SANDBOX_USER: missing (run setup)"; ok=0; fi
+  # does bwrap accept our argv and can it exec a shell with our mount set?
+  if command -v bwrap >/dev/null 2>&1; then
+    local t=(bwrap --die-with-parent --unshare-user --ro-bind /usr /usr
+             --proc /proc --dev /dev --size 1048576 --tmpfs /dev/shm)
+    local d
+    for d in bin lib lib64; do [[ -e /$d ]] && t+=(--ro-bind "/$d" "/$d"); done
+    if "${t[@]}" -- /bin/sh -c true 2>/dev/null; then echo "bwrap smoke test: OK"
+    else echo "bwrap smoke test: FAILED (argv/mounts broken)"; ok=0; fi
+  fi
   if [[ -r $CONF ]]; then echo "config: OK ($CONF)"; else echo "config: missing (run setup)"; ok=0; fi
   if [[ -r $SECRETS ]]; then echo "secrets: OK ($SECRETS)"; else echo "secrets: missing (run setup)"; ok=0; fi
   if command -v nft >/dev/null 2>&1 && nft list table inet pi-cell >/dev/null 2>&1; then

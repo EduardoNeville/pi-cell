@@ -12,8 +12,10 @@ process space, and network policy, with no Docker daemon and no VM.
   sandbox uid** allows only DNS (53), TLS (443), and the ports you configure
   (e.g. your database). Every other packet from the sandbox is dropped.
 - **Credentials:** your host `~/.pi/agent/auth.json` is **bind-mounted live**
-  into the sandbox (no copy; ACLs grant the sandbox user read); the egress
-  ruleset — not key placement — is the exfiltration control.
+  into the sandbox (no copy; ACLs grant the sandbox user read). Keys are
+  readable by pi by design — and egress is port-based (53 + 443 to any host),
+  so the ruleset is **not** an exfiltration control. Use a proxy or a
+  destination allowlist if that matters to you.
 
 ## Quickstart
 
@@ -54,9 +56,12 @@ sudo pi-cell teardown             # add --purge to also remove user + config
 | configured DB port / extra ports | yes (from `DB_ADDR`/`DB_PORT`/`EXTRA_PORTS`) |
 | anything else from the sandbox uid | **dropped** (nftables) |
 
-Inbound: loopback accepted (so you can reach a dev server pi starts on
-`127.0.0.1:PORT`), established/related replies accepted, everything else to
-the sandbox uid dropped.
+Inbound cannot be filtered per-uid on a shared netns (and a `policy drop` there
+would firewall the whole host), so it is left alone; the reverse channel is
+closed on the *output* side instead: replies are only accepted on flows the
+sandbox uid itself started, plus loopback (so you can still reach a dev server
+pi starts on `127.0.0.1:PORT`). Someone who connects *in* gets no usable
+channel back.
 
 ## It's just volumes
 
@@ -118,7 +123,17 @@ environment variables on the host — normally you can ignore it.
   (`bunx`, `bun --node`). Install other toolchains *inside* the sandbox
   (persisted in `/state`) or add them to the ro mounts.
 - **Credentials are readable by pi** — that's inherent (it needs them to call
-  the LLM). The egress ruleset is what prevents exfiltration; don't disable it.
+  the LLM). Egress is *port*-based (53 + 443 to any destination), so an injected
+  agent can still POST them anywhere: documented limit, not a bug. Values from
+  `secrets.env` are bind-mounted read-only at `/run/secrets.env` and sourced by
+  the launcher, so they never show up in `ps` / `/proc/*/cmdline`.
+- **The repo is the real exit.** Anything pi writes under `/workspace` runs as
+  *you* later: `.git/config` (`core.fsmonitor`, `core.pager`, `diff.external`),
+  `.git/hooks/*`, `package.json` scripts, `.vscode/tasks.json`. Review the diff
+  before you run repo tooling in that tree.
+- **Nested user namespaces** are blocked (`--disable-userns`) because that is the
+  main kernel-LPE surface. Set `ALLOW_NESTED_USERNS=1` in the config to run an
+  inner bwrap-based sandbox (e.g. Claude Code's Linux sandbox) inside the cell.
 - **DNS via Tailscale MagicDNS** works out of the box (it's just port 53).
 - **TUI & Ctrl-C** work through bwrap; if you ever hit a signal quirk, drop
   `--unshare-pid` in the `run` command.
