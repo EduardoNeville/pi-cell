@@ -57,6 +57,12 @@ load_config() {
   done
   DB_ADDR="${DB_ADDR:-}"
   DB_PORT="${DB_PORT:-5432}"
+  REPO_ROOT="${REPO_ROOT:-}"
+  if [[ -n $REPO_ROOT ]]; then
+    [[ -d $REPO_ROOT ]] || die "REPO_ROOT is not a directory: $REPO_ROOT"
+    REPO_ROOT=$(realpath -e -- "$REPO_ROOT") || die "cannot resolve REPO_ROOT: $REPO_ROOT"
+    [[ $REPO_ROOT != "$STATE_DIR"/* ]] || die "REPO_ROOT must not live under STATE_DIR"
+  fi
   EXTRA_PORTS="${EXTRA_PORTS:-}"
   PI_ARGS="${PI_ARGS:-}"
   GIT_NAME="${GIT_NAME:-}"
@@ -124,6 +130,16 @@ grant_secrets_access() {
 cmd_run() {
   [[ ${DRY_RUN:-0} == 1 ]] || need_root
   load_config
+
+  # --repo names a directory under REPO_ROOT (root-configured): one repo per job,
+  # so the caller can only pick a name, never a path.
+  if [[ -n ${JOB_REPO:-} ]]; then
+    [[ -n $REPO_ROOT ]] || die "--repo needs REPO_ROOT in $CONF"
+    [[ $JOB_REPO =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]] || die "invalid repo name: $JOB_REPO"
+    [[ -d $REPO_ROOT/$JOB_REPO ]] || die "no such repo under REPO_ROOT: $JOB_REPO"
+    REPO=$(realpath -e -- "$REPO_ROOT/$JOB_REPO") || die "cannot resolve repo: $JOB_REPO"
+    [[ $REPO == "$REPO_ROOT"/* ]] || die "--repo escapes REPO_ROOT: $JOB_REPO"
+  fi
 
   # one HOME per cell, so concurrent cells do not share pi sessions, auth.json
   # or bun's cache. No --cell = one long-lived cell in /state (as before).
@@ -271,6 +287,9 @@ cmd_setup() {
     cat > "$CONF" <<'CFG'
 # pi-cell configuration — paths only, NO secrets (put those in secrets.env)
 REPO=/home/eduardoneville/work/my-repo
+# Optional: per-job repos. `run --repo NAME` binds $REPO_ROOT/NAME as /workspace,
+# so one install serves many projects (NAME is a single directory component).
+REPO_ROOT=
 STATE_DIR=/var/lib/pi-cell/state
 BUN_HOST_DIR=/home/eduardoneville/.bun
 # Optional: host ~/.pi/agent dir (auth.json source of truth). Default: invoking user's.
@@ -353,13 +372,19 @@ EOF
 
   # 7. repo ACLs — sandbox can read/write the repo, and stays able to edit
   #    files you created; new files inherit ACLs for both of you (via umask 002)
-  if [[ -n $REPO && -d $REPO ]]; then
+  if [[ -n $REPO && -d $REPO ]] || [[ -n ${REPO_ROOT:-} && -d ${REPO_ROOT:-} ]]; then
     local realuser="${SUDO_USER:-root}"
-    info "granting rwx ACLs on $REPO for $SANDBOX_USER and $realuser"
-    setfacl -R -m u:"$SANDBOX_USER":rwx -m d:u:"$SANDBOX_USER":rwx -- "$REPO"
-    if [[ $realuser != root ]]; then
-      setfacl -R -m u:"$realuser":rwx -m d:u:"$realuser":rwx -- "$REPO"
-    fi
+    local acl_dirs=()
+    local d
+    [[ -n $REPO && -d $REPO ]] && acl_dirs+=("$REPO")
+    # per-job repos are created later by the caller, so the parent needs the
+    # default ACLs to hand down to them
+    [[ -n ${REPO_ROOT:-} && -d ${REPO_ROOT:-} ]] && acl_dirs+=("$REPO_ROOT")
+    info "granting rwx ACLs on ${acl_dirs[*]} for $SANDBOX_USER and $realuser"
+    for d in "${acl_dirs[@]}"; do
+      setfacl -R -m u:"$SANDBOX_USER":rwx -m d:u:"$SANDBOX_USER":rwx -- "$d"
+      [[ $realuser == root ]] || setfacl -R -m u:"$realuser":rwx -m d:u:"$realuser":rwx -- "$d"
+    done
   else
     info "REPO not set/valid yet — set REPO in $CONF and re-run setup for ACLs"
   fi
@@ -460,6 +485,7 @@ case "${1:-help}" in
       case $1 in
         --dry-run) DRY_RUN=1; shift ;;
         --cell)    CELL="${2:-}"; [[ -n $CELL ]] || die "--cell needs a name"; shift 2 ;;
+        --repo)    JOB_REPO="${2:-}"; [[ -n $JOB_REPO ]] || die "--repo needs a name"; shift 2 ;;
         --)        shift; break ;;
         *)         break ;;
       esac
